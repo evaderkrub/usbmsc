@@ -215,3 +215,77 @@ void usb_msc_task(void) {
         return;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier-2 recovery: Bulk-Only Mass Storage Reset + clear both halts
+// ---------------------------------------------------------------------------
+
+static bool bot_reset_recovery(void) {
+    // Class request: bmRequestType 0x21, bRequest 0xFF, wIndex = interface
+    const uint8_t setup[8] = {0x21, 0xFF, 0, 0, drive.cfg.msc_itf, 0, 0, 0};
+    if (hcd_control_xfer(drive.addr, setup, NULL, NULL) != HCD_OK) return false;
+    if (core_clear_endpoint_halt(drive.addr, drive.cfg.bulk_in) != HCD_OK) return false;
+    if (core_clear_endpoint_halt(drive.addr, drive.cfg.bulk_out) != HCD_OK) return false;
+    toggle_in = toggle_out = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Public read/write
+// ---------------------------------------------------------------------------
+
+#define MSC_MAX_SECTORS_PER_CMD 64u    // 32 KiB per READ(10)/WRITE(10)
+
+static msc_result_t rw10(bool write, uint32_t lba, uint16_t count, void *buf) {
+    uint8_t cb[10] = {
+        write ? 0x2A : 0x28, 0,
+        (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+        (uint8_t)(lba >> 8),  (uint8_t)lba,
+        0,
+        (uint8_t)(count >> 8), (uint8_t)count,
+        0,
+    };
+    uint32_t bytes = (uint32_t)count * block_size_;
+    uint8_t st;
+
+    // One command, with one tier-2 retry on transport-level failure.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        msc_result_t r = bot_command(cb, 10, !write, buf, bytes, &st, 5000);
+        if (r == MSC_DISCONNECTED) return r;
+        if (r == MSC_TRANSPORT_ERROR) {
+            if (attempt == 0 && bot_reset_recovery()) continue;   // tier 2
+            teardown();                                           // tier 3:
+            return MSC_TRANSPORT_ERROR;   // next usb_msc_task() re-enumerates
+        }
+        if (st != 0) {                    // command failed: capture sense
+            scsi_request_sense();
+            return MSC_MEDIA_ERROR;
+        }
+        return MSC_OK;
+    }
+    return MSC_TRANSPORT_ERROR;
+}
+
+static msc_result_t rw(bool write, uint32_t lba, uint32_t count, void *buf) {
+    if (state != ST_READY) return MSC_NOT_READY;
+    if (lba + count < lba || lba + count > block_count_) return MSC_MEDIA_ERROR;
+    uint8_t *p = (uint8_t *)buf;
+    while (count) {
+        uint16_t n = count > MSC_MAX_SECTORS_PER_CMD
+                   ? (uint16_t)MSC_MAX_SECTORS_PER_CMD : (uint16_t)count;
+        msc_result_t r = rw10(write, lba, n, p);
+        if (r != MSC_OK) return r;
+        lba += n;
+        count -= n;
+        p += (uint32_t)n * block_size_;
+    }
+    return MSC_OK;
+}
+
+msc_result_t usb_msc_read(uint32_t lba, uint32_t count, void *buf) {
+    return rw(false, lba, count, buf);
+}
+
+msc_result_t usb_msc_write(uint32_t lba, uint32_t count, const void *buf) {
+    return rw(true, lba, count, (void *)buf);
+}
