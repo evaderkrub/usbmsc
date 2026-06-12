@@ -165,24 +165,44 @@ void usb_msc_task(void) {
         sleep_ms(100);                            // attach debounce
         hcd_bus_reset();
         usb_device_t dev;
-        if (core_enumerate(1, &dev) != HCD_OK) { enter_failed(); return; }
+        hcd_result_t er = core_enumerate(1, &dev);
+        if (er != HCD_OK) {
+            printf("msc: enumeration failed (%d)\n", (int)er);
+            enter_failed();
+            return;
+        }
 
         if (dev.cfg.is_hub) {
             // Hub passthrough (Task 10): find a drive on a hub port,
             // reset it, enumerate it at address 2.
-            if (usb_hub_attach(&dev) != HCD_OK) { enter_failed(); return; }
-            if (usb_hub_wait_drive(&drive, 5000) != HCD_OK) { enter_failed(); return; }
+            if (usb_hub_attach(&dev) != HCD_OK) {
+                printf("msc: hub attach failed\n");
+                enter_failed();
+                return;
+            }
+            if (usb_hub_wait_drive(&drive, 5000) != HCD_OK) {
+                printf("msc: no drive found behind hub\n");
+                enter_failed();
+                return;
+            }
             via_hub = true;
         } else if (dev.cfg.is_msc) {
             drive = dev;
             via_hub = false;
         } else {
-            enter_failed();                       // not a drive, not a hub
+            printf("msc: device %04x:%04x is neither MSC nor hub\n", dev.vid, dev.pid);
+            enter_failed();
             return;
         }
         toggle_in = toggle_out = 0;
-        if (scsi_bringup() == MSC_OK) state = ST_READY;
-        else enter_failed();
+        msc_result_t br = scsi_bringup();
+        if (br == MSC_OK) {
+            state = ST_READY;
+        } else {
+            printf("msc: scsi bring-up failed (%d), sense=%06lx\n",
+                   (int)br, (unsigned long)last_sense);
+            enter_failed();
+        }
         return;
     }
     case ST_READY:
