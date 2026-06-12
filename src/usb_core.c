@@ -42,6 +42,8 @@ hcd_result_t core_enumerate(uint8_t addr_to_assign, usb_device_t *dev) {
     if (r != HCD_OK) return r;
     if (got < 8 || buf[1] != DT_DEVICE) return HCD_ERR_DATA;
     dev->ep0_mps = buf[7];
+    if (dev->ep0_mps != 8 && dev->ep0_mps != 16 &&
+        dev->ep0_mps != 32 && dev->ep0_mps != 64) return HCD_ERR_DATA;
     hcd_set_ep0_mps(dev->ep0_mps);
 
     // 2. Assign address
@@ -59,6 +61,7 @@ hcd_result_t core_enumerate(uint8_t addr_to_assign, usb_device_t *dev) {
     // 4. Config descriptor: header first for wTotalLength, then the whole thing
     r = core_get_descriptor(dev->addr, DT_CONFIG, 0, buf, 9, &got);
     if (r != HCD_OK) return r;
+    if (got < 9 || buf[1] != DT_CONFIG) return HCD_ERR_DATA;
     uint16_t total = (uint16_t)(buf[2] | (buf[3] << 8));
     if (total > sizeof buf) total = sizeof buf;
     r = core_get_descriptor(dev->addr, DT_CONFIG, 0, buf, total, &got);

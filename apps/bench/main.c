@@ -1,36 +1,26 @@
 #include <stdio.h>
-#include <string.h>
 #include "pico/stdlib.h"
-#include "usb_hcd.h"
-#include "usb_core.h"
+#include "usb_msc.h"
 
 int main(void) {
     stdio_init_all();
     sleep_ms(1000);
-    printf("usbmsc bench: stage 3 — enumeration\n");
-    hcd_init();
+    printf("usbmsc bench: stage 4 — drive bring-up\n");
+    usb_msc_init();
 
+    bool was_ready = false;
     for (;;) {
-        while (hcd_port_speed() != HCD_SPEED_FULL) sleep_ms(10);
-        printf("port: full-speed device, resetting\n");
-        sleep_ms(100);
-        hcd_bus_reset();
-        usb_device_t dev;
-        hcd_result_t r = core_enumerate(1, &dev);
-        if (r != HCD_OK) {
-            printf("enumeration failed: %d\n", (int)r);
-        } else {
-            printf("enumerated addr=%u vid=%04x pid=%04x ep0_mps=%u\n",
-                   dev.addr, dev.vid, dev.pid, dev.ep0_mps);
-            if (dev.cfg.is_msc)
-                printf("MSC: itf=%u bulk_in=%02x bulk_out=%02x mps=%u/%u\n",
-                       dev.cfg.msc_itf, dev.cfg.bulk_in, dev.cfg.bulk_out,
-                       dev.cfg.bulk_in_mps, dev.cfg.bulk_out_mps);
-            if (dev.cfg.is_hub)
-                printf("HUB: int_ep=%02x mps=%u interval=%u\n",
-                       dev.cfg.hub_int_ep, dev.cfg.hub_int_mps, dev.cfg.hub_int_interval);
+        usb_msc_task();
+        if (usb_msc_ready() && !was_ready) {
+            printf("drive ready: [%s]\n", usb_msc_drive_name());
+            printf("capacity: %lu blocks x %lu bytes = %llu MiB\n",
+                   (unsigned long)usb_msc_block_count(),
+                   (unsigned long)usb_msc_block_size(),
+                   (unsigned long long)usb_msc_block_count() *
+                       usb_msc_block_size() / (1024 * 1024));
         }
-        while (hcd_port_speed() != HCD_SPEED_NONE) sleep_ms(10);
-        printf("port: disconnected\n");
+        if (!usb_msc_ready() && was_ready) printf("drive removed\n");
+        was_ready = usb_msc_ready();
+        sleep_ms(10);
     }
 }
