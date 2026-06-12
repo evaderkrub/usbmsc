@@ -19,4 +19,5 @@ add_executable(bench apps/bench/main.c)
 target_link_libraries(bench usbmsc_host)
 pico_enable_stdio_uart(bench 1)
 pico_enable_stdio_usb(bench 0)   # we own the USB controller — never link stdio_usb
+pico_enable_stdio_rtt(bench 1)   # console over SWD debug probe (custom board, UART unwired)
 pico_add_extra_outputs(bench)
