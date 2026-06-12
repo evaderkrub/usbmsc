@@ -73,6 +73,7 @@ void msc_build_cbw(uint8_t cbw[MSC_CBW_LEN], uint32_t tag, uint32_t data_len,
     put_le32(cbw + 8, data_len);
     cbw[12] = dir_in ? 0x80 : 0x00;
     cbw[13] = lun;
+    if (cb_len > 16) cb_len = 16;    // CB field is exactly 16 bytes (BOT spec)
     cbw[14] = cb_len;
     memcpy(cbw + 15, cb, cb_len);
 }

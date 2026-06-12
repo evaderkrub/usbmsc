@@ -131,6 +131,15 @@ static void test_parse_alt_setting(void) {
     CHECK(info.bulk_out == 0x02 && info.bulk_out_mps == 64);
 }
 
+static void test_cbw_clamp(void) {
+    uint8_t cbw[MSC_CBW_LEN];
+    uint8_t big_cb[20];
+    for (int i = 0; i < 20; i++) big_cb[i] = (uint8_t)(i + 1);  // 1..20
+    msc_build_cbw(cbw, 1, 0, false, 0, big_cb, 20);
+    CHECK(cbw[14] == 16);                           // bCBWCBLength must be clamped to 16
+    CHECK(memcmp(cbw + 15, big_cb, 16) == 0);       // first 16 bytes copied
+}
+
 static void test_cbw_build(void) {
     uint8_t cbw[MSC_CBW_LEN];
     const uint8_t read10[10] = {0x28, 0, 0, 0, 0x12, 0x34, 0, 0, 0x40, 0};
@@ -167,6 +176,7 @@ int main(void) {
     test_parse_composite();
     test_parse_wrong_type();
     test_parse_alt_setting();
+    test_cbw_clamp();
     test_cbw_build();
     test_csw_parse();
     if (failures) {
