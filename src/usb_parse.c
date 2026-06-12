@@ -13,11 +13,17 @@ bool usb_parse_config(const uint8_t *d, uint16_t len, usb_cfg_info_t *out) {
     uint16_t off = 0;
     while (off < len) {
         uint8_t dlen = d[off];
-        if (dlen < 2 || (uint16_t)(off + dlen) > len) return false;
+        if (dlen < 2 || (uint32_t)off + dlen > len) return false;
         const uint8_t *p = d + off;
         switch (p[1]) {
         case DT_INTERFACE:
             if (dlen < 9) return false;
+            if (p[3] != 0) {
+                // Non-zero bAlternateSetting: ignore this interface and its endpoints
+                in_msc_itf = false;
+                in_hub_itf = false;
+                break;
+            }
             cur_itf = p[2];
             in_msc_itf = (p[5] == USB_CLASS_MSC && p[6] == MSC_SUBCLASS_SCSI &&
                           p[7] == MSC_PROTO_BOT && !out->is_msc);
