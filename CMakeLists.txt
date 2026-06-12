@@ -10,6 +10,7 @@ pico_sdk_init()
 
 add_library(usbmsc_host
     src/usb_parse.c
+    src/usb_hcd.c
 )
 target_include_directories(usbmsc_host PUBLIC src)
 target_link_libraries(usbmsc_host PUBLIC pico_stdlib hardware_resets)
