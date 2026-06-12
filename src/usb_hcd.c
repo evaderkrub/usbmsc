@@ -317,6 +317,8 @@ hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
     uint8_t *p = (uint8_t *)buf;
     uint32_t queued = 0;     // bytes assigned to a buffer half so far
     uint32_t done = 0;       // bytes confirmed transferred
+    uint8_t start_toggle = (uint8_t)(*toggle & 1);   // for short-IN toggle fix-up
+    uint32_t pkts_consumed = 0;                      // IN packets actually drained
     if (actual) *actual = 0;
 
     usbh_dpram->epx_ctrl = EP_CTRL_ENABLE_BITS | EP_CTRL_DOUBLE_BUFFERED_BITS
@@ -364,20 +366,32 @@ hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
             if (dir_in) {
                 if (!(bc & USB_BUF_CTRL_FULL)) break;        // not done yet
                 uint16_t rx = bc & USB_BUF_CTRL_LEN_MASK;
+                uint32_t cap = len - done;                   // user-buffer headroom
+                if (cap > 64) cap = 64;                      // half size
+                if (rx > cap) rx = (uint16_t)cap;            // babble guard
                 memcpy(p + done, epx_buf + next_half * 64, rx);
                 done += rx;
-                // Clear FULL so we don't re-service; re-arm if more queued
-                if (queued < len) {
-                    epx_prime_half(next_half, true, p, len, &queued, toggle);
-                } else {
-                    epx_buf_ctrl_write_half(next_half, 0);
-                }
+                pkts_consumed++;
                 if (rx < 64) {                               // short packet ends transfer
+                    // Revoke both halves -- safe, the SIE has stopped after a
+                    // short IN; the other half may still hold a stale prime.
+                    epx_buf_ctrl_write_half(next_half, 0);
+                    epx_buf_ctrl_write_half(next_half ^ 1, 0);
+                    // The prime-time toggle advance over-counts when a
+                    // transfer ends short; the wire truth is the number of
+                    // packets actually consumed.
+                    *toggle = (uint8_t)(start_toggle ^ (pkts_consumed & 1));
                     if (actual) *actual = done;
                     // hardware raises TRANS_COMPLETE for short IN packets;
                     // consume it if already latched, else don't wait for it
                     usb_hw_clear->sie_status = USB_SIE_STATUS_TRANS_COMPLETE_BITS;
                     return HCD_OK;
+                }
+                // Clear FULL so we don't re-service; re-arm if more queued
+                if (queued < len) {
+                    epx_prime_half(next_half, true, p, len, &queued, toggle);
+                } else {
+                    epx_buf_ctrl_write_half(next_half, 0);
                 }
             } else {
                 if (bc & USB_BUF_CTRL_AVAIL) break;          // hw still owns it
