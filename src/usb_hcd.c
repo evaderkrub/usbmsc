@@ -196,9 +196,11 @@ static void epx_abort(void) {
 }
 
 // Wait (polling) until TRANS_COMPLETE, an error, disconnect, or timeout.
-static hcd_result_t sie_wait_trans_complete(uint32_t timeout_ms) {
+// int_seen: caller must sample (usb_hw->buf_status & INT_EP_BUF_STATUS_BIT)
+// BEFORE calling sie_start_transfer() so the snapshot precedes any completion
+// that could be attributed to the EPX transfer rather than the int EP.
+static hcd_result_t sie_wait_trans_complete(uint32_t timeout_ms, bool int_seen) {
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
-    bool int_seen = (usb_hw->buf_status & INT_EP_BUF_STATUS_BIT) != 0;
     for (;;) {
         hcd_result_t err = sie_check_errors();
         if (err != HCD_OK) return err;
@@ -242,9 +244,10 @@ static hcd_result_t epx_single_packet(uint8_t dev_addr, uint8_t ep_num,
     }
     usb_hw_clear->buf_status = 1u;               // stale EPX buffer flag
     epx_buf_ctrl_write_half(0, bc);
+    bool int_seen = (usb_hw->buf_status & INT_EP_BUF_STATUS_BIT) != 0;
     sie_start_transfer(dir_in ? USB_SIE_CTRL_RECEIVE_DATA_BITS
                               : USB_SIE_CTRL_SEND_DATA_BITS);
-    hcd_result_t r = sie_wait_trans_complete(timeout_ms);
+    hcd_result_t r = sie_wait_trans_complete(timeout_ms, int_seen);
     if (r != HCD_OK) {
         // On timeout the SIE may still be retrying a NAKed transaction and
         // still owns the EPX buffer; cancel before the caller moves on.
@@ -272,8 +275,9 @@ hcd_result_t hcd_control_xfer(uint8_t dev_addr, const uint8_t setup[8],
     // --- SETUP stage: 8 bytes from the dedicated DPRAM setup area, DATA0 ---
     dpram_copy((void *)usbh_dpram->setup_packet, setup, 8);
     usb_hw->dev_addr_ctrl = dev_addr;            // endpoint 0
+    bool int_seen = (usb_hw->buf_status & INT_EP_BUF_STATUS_BIT) != 0;
     sie_start_transfer(USB_SIE_CTRL_SEND_SETUP_BITS);
-    hcd_result_t r = sie_wait_trans_complete(100);
+    hcd_result_t r = sie_wait_trans_complete(100, int_seen);
     if (r != HCD_OK) {
         if (r == HCD_ERR_TIMEOUT) epx_abort();   // SIE may still be retrying
         return r;
@@ -483,6 +487,7 @@ void hcd_int_ep_install(uint8_t dev_addr, uint8_t ep_addr, uint16_t mps,
         | (USB_TRANSFER_TYPE_INTERRUPT << EP_CTRL_BUFFER_TYPE_LSB)
         | ((uint32_t)(interval_ms ? interval_ms - 1 : 0) << EP_CTRL_HOST_INTERRUPT_INTERVAL_LSB)
         | INT_EP_BUF_OFFSET;
+    usb_hw_clear->buf_status = INT_EP_BUF_STATUS_BIT;  // clear any stale flag before arming
     int_ep_arm();
     hw_set_bits(&usb_hw->int_ep_ctrl, 1u << 1);   // enable int-ep slot 0 ("EP1")
 }

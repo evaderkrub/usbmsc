@@ -56,6 +56,7 @@ hcd_result_t usb_hub_attach(const usb_device_t *dev) {
     if (r != HCD_OK) return r;
     if (len < 7) return HCD_ERR_DATA;
     n_ports = hd[2];
+    if (n_ports > 7) n_ports = 7;   // status bitmap handling supports ports 1..7 (1-byte report)
 
     for (uint8_t p = 1; p <= n_ports; p++) {
         r = hub_set_port_feature(p, HUB_FEAT_PORT_POWER);

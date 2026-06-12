@@ -39,5 +39,5 @@ hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
 void hcd_int_ep_install(uint8_t dev_addr, uint8_t ep_addr, uint16_t mps,
                         uint8_t interval_ms);
 void hcd_int_ep_remove(void);
-// >0: bytes copied to buf; 0: no new data; <0: error
+// >0: bytes copied to buf; 0: no new data (a zero-length report is indistinguishable)
 int  hcd_int_ep_poll(uint8_t *buf, uint8_t maxlen);

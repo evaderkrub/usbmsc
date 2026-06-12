@@ -42,7 +42,6 @@ static msc_result_t bot_command(const uint8_t *cb, uint8_t cb_len, bool dir_in,
     if (r == HCD_ERR_DISCONNECT) return MSC_DISCONNECTED;
     if (r != HCD_OK) return MSC_TRANSPORT_ERROR;
 
-    bool data_stalled = false;
     if (data_len) {
         uint8_t ep = dir_in ? drive.cfg.bulk_in : drive.cfg.bulk_out;
         uint8_t *tog = dir_in ? &toggle_in : &toggle_out;
@@ -54,7 +53,6 @@ static msc_result_t bot_command(const uint8_t *cb, uint8_t cb_len, bool dir_in,
             if (core_clear_endpoint_halt(drive.addr, ep) != HCD_OK)
                 return MSC_TRANSPORT_ERROR;
             *tog = 0;
-            data_stalled = true;
         } else if (r != HCD_OK) {
             return MSC_TRANSPORT_ERROR;
         }
@@ -75,7 +73,6 @@ static msc_result_t bot_command(const uint8_t *cb, uint8_t cb_len, bool dir_in,
 
     if (!msc_parse_csw(csw, tag, csw_status)) return MSC_TRANSPORT_ERROR;
     if (*csw_status == 2) return MSC_TRANSPORT_ERROR;   // phase error -> tier 2
-    (void)data_stalled;
     return MSC_OK;
 }
 
@@ -103,6 +100,7 @@ static msc_result_t scsi_bringup(void) {
     uint8_t inq[36] = {0};
     msc_result_t r = bot_command(inq_cb, 6, true, inq, 36, &st, 2000);
     if (r != MSC_OK) return r;
+    if (st != 0) return MSC_MEDIA_ERROR;
     memcpy(drive_name, inq + 8, 28);
     drive_name[28] = '\0';
 
@@ -142,6 +140,7 @@ static void teardown(void) {
     state = ST_DISCONNECTED;
     block_count_ = block_size_ = 0;
     toggle_in = toggle_out = 0;
+    last_sense = 0;
     if (via_hub) usb_hub_detach();
     via_hub = false;
 }
