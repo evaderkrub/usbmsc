@@ -20,19 +20,20 @@ Do not degrade these without telling the user.
 - VBUS is hardwired on; the driver fakes VBUS detect via override.
 - **The board's UART is not wired to any USB-serial adapter.** Console output
   travels over **SEGGER RTT** through the Raspberry Pi Debug Probe
-  (`pico_enable_stdio_rtt` is set in CMakeLists.txt). COM7/COM8/COM9 exist on
-  the host PC but none carries the board's stdio.
+  (`pico_enable_stdio_rtt` is set in CMakeLists.txt). USB-serial COM ports may
+  exist on the host PC, but none carries the board's stdio — don't go looking.
 - Flashing is done via OpenOCD + the Debug Probe (BOOTSEL works too but the
   probe is faster and scriptable).
 
 ## Build
 
-`PICO_SDK_PATH` is NOT set globally on this machine. Every firmware
-configure/build needs (PowerShell):
+`PICO_SDK_PATH` may not be set globally. The official Pico VS Code extension
+layout lives under `$env:USERPROFILE\.pico-sdk` (SDK 2.2.0, ARM GCC 14.2).
+Every firmware configure/build needs (PowerShell):
 
 ```powershell
-$env:PICO_SDK_PATH="C:\Users\dave\.pico-sdk\sdk\2.2.0"
-$env:Path="C:\Users\dave\.pico-sdk\toolchain\14_2_Rel1\bin;$env:Path"
+$env:PICO_SDK_PATH="$env:USERPROFILE\.pico-sdk\sdk\2.2.0"
+$env:Path="$env:USERPROFILE\.pico-sdk\toolchain\14_2_Rel1\bin;$env:Path"
 cmake -S . -B build -G Ninja     # first time only
 cmake --build build              # produces build/bench.elf + bench.uf2
 ```
@@ -51,7 +52,7 @@ Only ONE OpenOCD instance can own the probe — kill any old one first.
 
 ```powershell
 Get-Process openocd -ErrorAction SilentlyContinue | Stop-Process -Force
-$ocd="C:\Users\dave\.pico-sdk\openocd\0.12.0+dev"
+$ocd="$env:USERPROFILE\.pico-sdk\openocd\0.12.0+dev"
 & "$ocd\openocd.exe" -s "$ocd\scripts" -f interface/cmsis-dap.cfg -f target/rp2350.cfg `
   -c "adapter speed 5000" -c "init" -c "program build/bench.elf verify" -c "reset run" `
   -c "sleep 2500" -c "rtt setup 0x20000000 0x82000 {SEGGER RTT}" -c "rtt start" `
