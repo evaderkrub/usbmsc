@@ -25,6 +25,7 @@ void hcd_set_ep0_mps(uint8_t mps);
 
 // Blocking control transfer. setup = 8-byte setup packet. data/inout_len for
 // the data stage (NULL/0 for none); *inout_len in = buffer size, out = actual.
+// For OUT data stages the caller must supply exactly wLength bytes.
 hcd_result_t hcd_control_xfer(uint8_t dev_addr, const uint8_t setup[8],
                               void *data, uint16_t *inout_len);
 

@@ -113,6 +113,8 @@ static uint16_t epx_buf_ctrl_read_half(int half) {
 // Per RP2040/RP2350 erratum, START_TRANS must be set a few cycles after the
 // rest of SIE_CTRL.
 static void sie_start_transfer(uint32_t dir_bits) {
+    // clear any stale completion from a previous errored transfer
+    usb_hw_clear->sie_status = USB_SIE_STATUS_TRANS_COMPLETE_BITS;
     usb_hw->sie_ctrl = SIE_CTRL_BASE | dir_bits;
     busy_wait_at_least_cycles(12);
     usb_hw->sie_ctrl = SIE_CTRL_BASE | dir_bits | USB_SIE_CTRL_START_TRANS_BITS;
@@ -138,6 +140,10 @@ static hcd_result_t sie_check_errors(void) {
     return HCD_OK;
 }
 
+// TODO(Task 7): on HCD_ERR_TIMEOUT the SIE may still be retrying a NAKed
+// transaction; use EP_ABORT/EP_ABORT_DONE to cancel cleanly before the next
+// transfer is started. Required before bulk transfers where NAK-past-deadline
+// is routine.
 // Wait (polling) until TRANS_COMPLETE, an error, disconnect, or timeout.
 static hcd_result_t sie_wait_trans_complete(uint32_t timeout_ms) {
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
