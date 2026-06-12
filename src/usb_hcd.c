@@ -43,9 +43,7 @@
 #define EPX_BUF_OFFSET    0x180u            // 2 x 64 bytes, EPX double buffer
 #define INT_EP_BUF_OFFSET 0x200u            // 64 bytes, hub interrupt endpoint
 static uint8_t *const epx_buf    = (uint8_t *)(USBCTRL_DPRAM_BASE + EPX_BUF_OFFSET);
-// Task 10: hub interrupt-endpoint buffer pointer. Commented out until then to
-// avoid an unused-variable warning.
-// static uint8_t *const int_ep_buf = (uint8_t *)(USBCTRL_DPRAM_BASE + INT_EP_BUF_OFFSET);
+static uint8_t *const int_ep_buf = (uint8_t *)(USBCTRL_DPRAM_BASE + INT_EP_BUF_OFFSET);
 
 // Endpoint-type encoding for the EP_CONTROL ENDPOINT_TYPE field (bits 27:26,
 // EP_CTRL_BUFFER_TYPE_LSB). SDK 2.2.0 defines no USB_TRANSFER_TYPE_* names
@@ -408,4 +406,77 @@ hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
     }
     if (actual) *actual = done;
     return HCD_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Hardware-polled interrupt endpoint (one supported; used by the hub)
+// ---------------------------------------------------------------------------
+// The controller polls registered interrupt endpoints autonomously every
+// `interval` frames; completions appear in BUFF_STATUS. We use slot 0
+// (= "interrupt endpoint 1" in register terms).
+//
+// Register evidence (SDK 2.2.0, verified for Task 10):
+//   - BUFF_STATUS bit for slot 0: regs/usb.h USB_BUFF_STATUS_EP1_IN_BITS
+//     = 0x00000004 (bit 2), consistent with the EPn_IN = bit 2n mapping
+//     noted at the top of this file.
+//   - Interval field: usb_dpram.h EP_CTRL_HOST_INTERRUPT_INTERVAL_LSB = 16.
+//     The SDK headers carry no semantics comment; TinyUSB hcd_rp2040.c
+//     writes ((bmInterval - 1) << EP_CTRL_HOST_INTERRUPT_INTERVAL_LSB), so
+//     the field holds interval-in-ms MINUS 1 (0 => poll every frame).
+//   - Address/enable: structs/usb.h int_ep_addr_ctrl[15] starts at
+//     ADDR_ENDP1 (ADDRESS bits 6:0, ENDPOINT bits 19:16, INTEP_DIR bit 25
+//     "In=0, Out=1" -- IN is the reset value, so we leave it clear), and
+//     USB_INT_EP_CTRL_INT_EP_ACTIVE is bits 15:1 "Host: Enable interrupt
+//     endpoint 1 -> 15" -- slot 0 ("EP1") enables via bit 1.
+//   - INTEP_PREAMBLE (ADDR_ENDPn bit 26) is only for "a low speed device on
+//     a full speed hub"; we support FS only, so it stays 0.
+
+static uint8_t  int_ep_toggle;
+static uint16_t int_ep_mps;
+
+#define INT_EP_BUF_STATUS_BIT USB_BUFF_STATUS_EP1_IN_BITS   // bit 2
+
+static void int_ep_arm(void) {
+    uint16_t bc = (uint16_t)(int_ep_mps | USB_BUF_CTRL_AVAIL | USB_BUF_CTRL_LAST
+                  | (int_ep_toggle ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID));
+    io_rw_16 *p = (io_rw_16 *)&usbh_dpram->int_ep_buffer_ctrl[0].ctrl;
+    p[0] = bc & ~USB_BUF_CTRL_AVAIL;
+    busy_wait_at_least_cycles(12);
+    p[0] = bc;
+}
+
+void hcd_int_ep_install(uint8_t dev_addr, uint8_t ep_addr, uint16_t mps,
+                        uint8_t interval_ms) {
+    int_ep_toggle = 0;
+    int_ep_mps = mps;
+    usb_hw->int_ep_addr_ctrl[0] = (uint32_t)dev_addr
+        | ((uint32_t)(ep_addr & 0x0F) << USB_ADDR_ENDP_ENDPOINT_LSB);
+    // Interval field semantics: value = poll interval in ms minus 1.
+    usbh_dpram->int_ep_ctrl[0].ctrl = EP_CTRL_ENABLE_BITS | EP_CTRL_INTERRUPT_PER_BUFFER
+        | (USB_TRANSFER_TYPE_INTERRUPT << EP_CTRL_BUFFER_TYPE_LSB)
+        | ((uint32_t)(interval_ms ? interval_ms - 1 : 0) << EP_CTRL_HOST_INTERRUPT_INTERVAL_LSB)
+        | INT_EP_BUF_OFFSET;
+    int_ep_arm();
+    hw_set_bits(&usb_hw->int_ep_ctrl, 1u << 1);   // enable int-ep slot 0 ("EP1")
+}
+
+void hcd_int_ep_remove(void) {
+    hw_clear_bits(&usb_hw->int_ep_ctrl, 1u << 1);
+    usbh_dpram->int_ep_ctrl[0].ctrl = 0;
+    usb_hw_clear->buf_status = INT_EP_BUF_STATUS_BIT;
+}
+
+int hcd_int_ep_poll(uint8_t *buf, uint8_t maxlen) {
+    if (!(usb_hw->buf_status & INT_EP_BUF_STATUS_BIT)) return 0;
+    usb_hw_clear->buf_status = INT_EP_BUF_STATUS_BIT;
+    uint16_t bc = ((io_rw_16 *)&usbh_dpram->int_ep_buffer_ctrl[0].ctrl)[0];
+    uint16_t n = bc & USB_BUF_CTRL_LEN_MASK;
+    if (n > maxlen) n = maxlen;
+    memcpy(buf, int_ep_buf, n);
+    // The hardware retries NAKed polls invisibly and only completes (raising
+    // BUFF_STATUS) when a report actually lands, so the toggle advances
+    // exactly once per delivered report.
+    int_ep_toggle ^= 1;
+    int_ep_arm();
+    return (int)n;
 }
