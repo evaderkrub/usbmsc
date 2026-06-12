@@ -140,10 +140,44 @@ static hcd_result_t sie_check_errors(void) {
     return HCD_OK;
 }
 
-// TODO(Task 7): on HCD_ERR_TIMEOUT the SIE may still be retrying a NAKed
-// transaction; use EP_ABORT/EP_ABORT_DONE to cancel cleanly before the next
-// transfer is started. Required before bulk transfers where NAK-past-deadline
-// is routine.
+// Cancel any in-flight EPX transfer so the SIE no longer owns the EPX
+// buffers. Called on error exits from transfers (timeouts above all: the SIE
+// may still be endlessly retrying a NAKed transaction, and starting the next
+// transfer over that corrupts it). Resolves the former Task-5 TODO here.
+//
+// Mechanism (SDK 2.2.0 regs/usb.h): the EP_ABORT / EP_ABORT_DONE registers
+// are NOT applicable -- both register descriptions begin "Device only:"
+// ("Device only: Can be set to ignore the buffer control register ..." /
+// "Device only: Used in conjunction with `EP_ABORT`...").  The documented
+// host-mode control is SIE_CTRL.STOP_TRANS: "Host: Stop transaction",
+// access type "SC" (self-clearing). Write it together with the base host
+// bits -- the same write also drops any pending SEND_DATA/RECEIVE_DATA
+// request -- then wait (bounded) for the self-clear, then reclaim EPX.
+static void epx_abort(void) {
+    usb_hw->sie_ctrl = SIE_CTRL_BASE | USB_SIE_CTRL_STOP_TRANS_BITS;
+    // Bounded wait for the self-clearing bit; 1 ms >> one max-size FS packet
+    // time (~50 us), so any packet already on the wire has finished too.
+    absolute_time_t deadline = make_timeout_time_ms(1);
+    while ((usb_hw->sie_ctrl & USB_SIE_CTRL_STOP_TRANS_BITS)
+           && !time_reached(deadline)) {
+        tight_loop_contents();
+    }
+    // Reclaim EPX: revoke both buffer-control halves, drop the EPX buffer
+    // flag and any completion/error status the aborted transfer left behind
+    // (a stale error bit would otherwise fail the next transfer's first
+    // sie_check_errors()).
+    epx_buf_ctrl_write_half(0, 0);
+    epx_buf_ctrl_write_half(1, 0);
+    usb_hw_clear->buf_status = 1u;
+    usb_hw_clear->sie_status = USB_SIE_STATUS_TRANS_COMPLETE_BITS
+                             | USB_SIE_STATUS_STALL_REC_BITS
+                             | USB_SIE_STATUS_RX_TIMEOUT_BITS
+                             | USB_SIE_STATUS_RX_OVERFLOW_BITS
+                             | USB_SIE_STATUS_DATA_SEQ_ERROR_BITS
+                             | USB_SIE_STATUS_CRC_ERROR_BITS
+                             | USB_SIE_STATUS_BIT_STUFF_ERROR_BITS;
+}
+
 // Wait (polling) until TRANS_COMPLETE, an error, disconnect, or timeout.
 static hcd_result_t sie_wait_trans_complete(uint32_t timeout_ms) {
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
@@ -184,7 +218,12 @@ static hcd_result_t epx_single_packet(uint8_t dev_addr, uint8_t ep_num,
     sie_start_transfer(dir_in ? USB_SIE_CTRL_RECEIVE_DATA_BITS
                               : USB_SIE_CTRL_SEND_DATA_BITS);
     hcd_result_t r = sie_wait_trans_complete(timeout_ms);
-    if (r != HCD_OK) return r;
+    if (r != HCD_OK) {
+        // On timeout the SIE may still be retrying a NAKed transaction and
+        // still owns the EPX buffer; cancel before the caller moves on.
+        if (r == HCD_ERR_TIMEOUT) epx_abort();
+        return r;
+    }
 
     if (dir_in) {
         uint16_t rx = epx_buf_ctrl_read_half(0) & USB_BUF_CTRL_LEN_MASK;
@@ -208,7 +247,10 @@ hcd_result_t hcd_control_xfer(uint8_t dev_addr, const uint8_t setup[8],
     usb_hw->dev_addr_ctrl = dev_addr;            // endpoint 0
     sie_start_transfer(USB_SIE_CTRL_SEND_SETUP_BITS);
     hcd_result_t r = sie_wait_trans_complete(100);
-    if (r != HCD_OK) return r;
+    if (r != HCD_OK) {
+        if (r == HCD_ERR_TIMEOUT) epx_abort();   // SIE may still be retrying
+        return r;
+    }
 
     // --- DATA stage: mps-sized packets, toggle starts at DATA1 ---
     uint16_t total = 0;
@@ -237,4 +279,119 @@ hcd_result_t hcd_control_xfer(uint8_t dev_addr, const uint8_t setup[8],
     uint16_t zero = 0;
     uint8_t dummy[1];
     return epx_single_packet(dev_addr, 0, status_in, 1, dummy, 0, &zero, 100);
+}
+
+// ---------------------------------------------------------------------------
+// Bulk transfers: double-buffered EPX pump
+// ---------------------------------------------------------------------------
+
+// Prime one half of the EPX double buffer for the next packet of the
+// transfer. *toggle is the DATA toggle; *queued tracks bytes already
+// assigned to buffers.
+//
+// Note (by design, see hcd_bulk_xfer): the DATA toggle advances at prime
+// time, not completion time. If the transfer is aborted mid-flight the
+// caller's toggle is wrong -- accepted, because every MSC error path ends in
+// CLEAR_FEATURE(ENDPOINT_HALT) (which resets both sides' toggles) or a bus
+// reset.
+static void epx_prime_half(int half, bool dir_in, const uint8_t *src,
+                           uint32_t len, uint32_t *queued, uint8_t *toggle) {
+    uint32_t remaining = len - *queued;
+    uint16_t n = remaining > 64 ? 64 : (uint16_t)remaining;
+    uint16_t bc = (uint16_t)(n | USB_BUF_CTRL_AVAIL
+                  | (*toggle ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID));
+    if (n == remaining) bc |= USB_BUF_CTRL_LAST;
+    if (!dir_in) {
+        memcpy(epx_buf + half * 64, src + *queued, n);
+        bc |= USB_BUF_CTRL_FULL;
+    }
+    *queued += n;
+    *toggle ^= 1;
+    epx_buf_ctrl_write_half(half, bc);
+}
+
+hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
+                           void *buf, uint32_t len, uint32_t *actual,
+                           uint32_t timeout_ms) {
+    bool dir_in = (ep_addr & 0x80u) != 0;
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t queued = 0;     // bytes assigned to a buffer half so far
+    uint32_t done = 0;       // bytes confirmed transferred
+    if (actual) *actual = 0;
+
+    usbh_dpram->epx_ctrl = EP_CTRL_ENABLE_BITS | EP_CTRL_DOUBLE_BUFFERED_BITS
+                         | EP_CTRL_INTERRUPT_PER_BUFFER
+                         | (USB_TRANSFER_TYPE_BULK << EP_CTRL_BUFFER_TYPE_LSB)
+                         | EPX_BUF_OFFSET;
+    usb_hw->dev_addr_ctrl = (uint32_t)dev_addr
+                          | ((uint32_t)(ep_addr & 0x0F) << USB_ADDR_ENDP_ENDPOINT_LSB);
+    usb_hw_clear->buf_status = 1u;               // stale EPX flag
+
+    // Prime both halves (half 1 only if the transfer needs a second packet).
+    epx_prime_half(0, dir_in, p, len, &queued, toggle);
+    if (queued < len) epx_prime_half(1, dir_in, p, len, &queued, toggle);
+
+    sie_start_transfer(dir_in ? USB_SIE_CTRL_RECEIVE_DATA_BITS
+                              : USB_SIE_CTRL_SEND_DATA_BITS);
+
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    int next_half = 0;                           // hardware consumes 0,1,0,1,...
+    bool complete = false;
+
+    while (!complete || done < queued) {
+        // TRANS_COMPLETE can arrive together with the final buffer flag;
+        // latch it but keep draining buffers until done catches up.
+        if (usb_hw->sie_status & USB_SIE_STATUS_TRANS_COMPLETE_BITS) {
+            usb_hw_clear->sie_status = USB_SIE_STATUS_TRANS_COMPLETE_BITS;
+            complete = true;
+        }
+        hcd_result_t err = sie_check_errors();
+        if (err != HCD_OK) { epx_abort(); return err; }
+        if (hcd_port_speed() == HCD_SPEED_NONE) { epx_abort(); return HCD_ERR_DISCONNECT; }
+        if (time_reached(deadline)) { epx_abort(); return HCD_ERR_TIMEOUT; }
+        if (!(usb_hw->buf_status & 1u)) continue;
+
+        // At least one half finished. Service in strict alternation; check
+        // the half's own status bits rather than trusting the flag count.
+        usb_hw_clear->buf_status = 1u;
+        for (;;) {
+            // Nothing in flight (queued bytes all confirmed) -> stop: a
+            // drained-and-revoked half reads as 0, which for OUT would
+            // otherwise be indistinguishable from "hardware finished it"
+            // (AVAIL clear) and spin this loop forever.
+            if (done == queued) break;
+            uint16_t bc = epx_buf_ctrl_read_half(next_half);
+            if (dir_in) {
+                if (!(bc & USB_BUF_CTRL_FULL)) break;        // not done yet
+                uint16_t rx = bc & USB_BUF_CTRL_LEN_MASK;
+                memcpy(p + done, epx_buf + next_half * 64, rx);
+                done += rx;
+                // Clear FULL so we don't re-service; re-arm if more queued
+                if (queued < len) {
+                    epx_prime_half(next_half, true, p, len, &queued, toggle);
+                } else {
+                    epx_buf_ctrl_write_half(next_half, 0);
+                }
+                if (rx < 64) {                               // short packet ends transfer
+                    if (actual) *actual = done;
+                    // hardware raises TRANS_COMPLETE for short IN packets;
+                    // consume it if already latched, else don't wait for it
+                    usb_hw_clear->sie_status = USB_SIE_STATUS_TRANS_COMPLETE_BITS;
+                    return HCD_OK;
+                }
+            } else {
+                if (bc & USB_BUF_CTRL_AVAIL) break;          // hw still owns it
+                uint16_t tx = bc & USB_BUF_CTRL_LEN_MASK;
+                done += tx;
+                if (queued < len) {
+                    epx_prime_half(next_half, false, p, len, &queued, toggle);
+                } else {
+                    epx_buf_ctrl_write_half(next_half, 0);
+                }
+            }
+            next_half ^= 1;
+        }
+    }
+    if (actual) *actual = done;
+    return HCD_OK;
 }
