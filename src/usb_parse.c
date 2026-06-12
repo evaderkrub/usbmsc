@@ -55,3 +55,32 @@ bool usb_parse_config(const uint8_t *d, uint16_t len, usb_cfg_info_t *out) {
     if (out->is_hub && !out->hub_int_ep) return false;
     return out->is_msc || out->is_hub;
 }
+
+static void put_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static uint32_t get_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+void msc_build_cbw(uint8_t cbw[MSC_CBW_LEN], uint32_t tag, uint32_t data_len,
+                   bool dir_in, uint8_t lun, const uint8_t *cb, uint8_t cb_len) {
+    memset(cbw, 0, MSC_CBW_LEN);
+    put_le32(cbw, 0x43425355u);          // dCBWSignature 'USBC'
+    put_le32(cbw + 4, tag);
+    put_le32(cbw + 8, data_len);
+    cbw[12] = dir_in ? 0x80 : 0x00;
+    cbw[13] = lun;
+    cbw[14] = cb_len;
+    memcpy(cbw + 15, cb, cb_len);
+}
+
+bool msc_parse_csw(const uint8_t csw[MSC_CSW_LEN], uint32_t tag, uint8_t *status) {
+    if (get_le32(csw) != 0x53425355u) return false;   // dCSWSignature 'USBS'
+    if (get_le32(csw + 4) != tag) return false;
+    if (csw[12] > 2) return false;
+    *status = csw[12];
+    return true;
+}

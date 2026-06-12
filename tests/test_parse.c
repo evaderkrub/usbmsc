@@ -131,6 +131,34 @@ static void test_parse_alt_setting(void) {
     CHECK(info.bulk_out == 0x02 && info.bulk_out_mps == 64);
 }
 
+static void test_cbw_build(void) {
+    uint8_t cbw[MSC_CBW_LEN];
+    const uint8_t read10[10] = {0x28, 0, 0, 0, 0x12, 0x34, 0, 0, 0x40, 0};
+    msc_build_cbw(cbw, 0xDEADBEEF, 0x8000, true, 0, read10, sizeof read10);
+    CHECK(cbw[0] == 0x55 && cbw[1] == 0x53 && cbw[2] == 0x42 && cbw[3] == 0x43); // 'USBC'
+    CHECK(cbw[4] == 0xEF && cbw[5] == 0xBE && cbw[6] == 0xAD && cbw[7] == 0xDE); // tag LE
+    CHECK(cbw[8] == 0x00 && cbw[9] == 0x80 && cbw[10] == 0 && cbw[11] == 0);     // len LE
+    CHECK(cbw[12] == 0x80);                                                       // IN
+    CHECK(cbw[13] == 0 && cbw[14] == 10);                                         // lun, cb_len
+    CHECK(memcmp(cbw + 15, read10, 10) == 0);
+    CHECK(cbw[25] == 0 && cbw[30] == 0);                                          // zero padding
+}
+
+static void test_csw_parse(void) {
+    uint8_t status;
+    uint8_t csw[MSC_CSW_LEN] = {0x55, 0x53, 0x42, 0x53,            // 'USBS'
+        0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0, 0};
+    CHECK(msc_parse_csw(csw, 0xDEADBEEF, &status) && status == 0);
+    csw[12] = 1;
+    CHECK(msc_parse_csw(csw, 0xDEADBEEF, &status) && status == 1);
+    csw[12] = 3;
+    CHECK(!msc_parse_csw(csw, 0xDEADBEEF, &status));   // invalid status
+    csw[12] = 0;
+    CHECK(!msc_parse_csw(csw, 0x12345678, &status));   // wrong tag
+    csw[0] = 0x56;
+    CHECK(!msc_parse_csw(csw, 0xDEADBEEF, &status));   // bad signature
+}
+
 int main(void) {
     test_parse_msc();
     test_parse_hub();
@@ -139,6 +167,8 @@ int main(void) {
     test_parse_composite();
     test_parse_wrong_type();
     test_parse_alt_setting();
+    test_cbw_build();
+    test_csw_parse();
     if (failures) {
         printf("FAILED (%d)\n", failures);
     } else {

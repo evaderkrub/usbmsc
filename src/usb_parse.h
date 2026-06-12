@@ -26,3 +26,14 @@ typedef struct {
 // Walk a full configuration descriptor (config + interface + endpoint TLVs).
 // Returns false on malformed/truncated input.
 bool usb_parse_config(const uint8_t *d, uint16_t len, usb_cfg_info_t *out);
+
+#define MSC_CBW_LEN 31
+#define MSC_CSW_LEN 13
+
+// Fill a 31-byte Command Block Wrapper. cb_len <= 16.
+void msc_build_cbw(uint8_t cbw[MSC_CBW_LEN], uint32_t tag, uint32_t data_len,
+                   bool dir_in, uint8_t lun, const uint8_t *cb, uint8_t cb_len);
+
+// Validate a 13-byte Command Status Wrapper (signature, tag, status <= 2).
+// On success writes bCSWStatus (0=passed, 1=failed, 2=phase error) to *status.
+bool msc_parse_csw(const uint8_t csw[MSC_CSW_LEN], uint32_t tag, uint8_t *status);
