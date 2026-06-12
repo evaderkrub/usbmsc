@@ -42,6 +42,7 @@
 // register area occupies the bottom 0x180):
 #define EPX_BUF_OFFSET    0x180u            // 2 x 64 bytes, EPX double buffer
 #define INT_EP_BUF_OFFSET 0x200u            // 64 bytes, hub interrupt endpoint
+#define INT_EP_BUF_STATUS_BIT USB_BUFF_STATUS_EP1_IN_BITS   // bit 2
 static uint8_t *const epx_buf    = (uint8_t *)(USBCTRL_DPRAM_BASE + EPX_BUF_OFFSET);
 static uint8_t *const int_ep_buf = (uint8_t *)(USBCTRL_DPRAM_BASE + INT_EP_BUF_OFFSET);
 
@@ -179,11 +180,21 @@ static void epx_abort(void) {
 // Wait (polling) until TRANS_COMPLETE, an error, disconnect, or timeout.
 static hcd_result_t sie_wait_trans_complete(uint32_t timeout_ms) {
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    bool int_seen = (usb_hw->buf_status & INT_EP_BUF_STATUS_BIT) != 0;
     for (;;) {
         hcd_result_t err = sie_check_errors();
         if (err != HCD_OK) return err;
         if (usb_hw->sie_status & USB_SIE_STATUS_TRANS_COMPLETE_BITS) {
             usb_hw_clear->sie_status = USB_SIE_STATUS_TRANS_COMPLETE_BITS;
+            // Int-EP completions also raise TRANS_COMPLETE (regs/usb.h: "An IN
+            // packet is received and LAST_BUFF is set"). If a NEW int-EP
+            // completion appeared during this wait and EPX shows no buffer
+            // completion of its own, the TC was the int EP's: keep waiting.
+            if (!int_seen && (usb_hw->buf_status & INT_EP_BUF_STATUS_BIT)
+                          && !(usb_hw->buf_status & 1u)) {
+                int_seen = true;
+                continue;
+            }
             return HCD_OK;
         }
         if (hcd_port_speed() == HCD_SPEED_NONE) return HCD_ERR_DISCONNECT;
@@ -433,8 +444,6 @@ hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
 
 static uint8_t  int_ep_toggle;
 static uint16_t int_ep_mps;
-
-#define INT_EP_BUF_STATUS_BIT USB_BUFF_STATUS_EP1_IN_BITS   // bit 2
 
 static void int_ep_arm(void) {
     uint16_t bc = (uint16_t)(int_ep_mps | USB_BUF_CTRL_AVAIL | USB_BUF_CTRL_LAST
