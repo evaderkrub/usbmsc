@@ -46,6 +46,21 @@
 static uint8_t *const epx_buf    = (uint8_t *)(USBCTRL_DPRAM_BASE + EPX_BUF_OFFSET);
 static uint8_t *const int_ep_buf = (uint8_t *)(USBCTRL_DPRAM_BASE + INT_EP_BUF_OFFSET);
 
+// USB DPRAM is Device memory on the M33: every access must be naturally
+// aligned. Newlib's optimized memcpy uses unaligned word/halfword accesses
+// for tails and dst-alignment fixups, which hardfault against DPRAM
+// (UNALIGNED UsageFault, verified on hardware). This copy uses only
+// naturally aligned word accesses plus a byte tail.
+static void dpram_copy(void *dst, const void *src, uint32_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if ((((uintptr_t)d | (uintptr_t)s) & 3u) == 0) {
+        for (; n >= 4; n -= 4, d += 4, s += 4)
+            *(uint32_t *)d = *(const uint32_t *)s;
+    }
+    while (n--) *d++ = *s++;
+}
+
 // Endpoint-type encoding for the EP_CONTROL ENDPOINT_TYPE field (bits 27:26,
 // EP_CTRL_BUFFER_TYPE_LSB). SDK 2.2.0 defines no USB_TRANSFER_TYPE_* names
 // (verified: absent from regs/usb.h and structs/usb_dpram.h), so define them
@@ -64,6 +79,9 @@ void hcd_init(void) {
     unreset_block_num_wait_blocking(RESET_USBCTRL);
     // usb_host_dpram_t covers the full 4 KB DPRAM (static_assert in
     // usb_dpram.h), so this clears the data-buffer region at 0x180+ too.
+    // Plain memset is alignment-safe here (unlike memcpy elsewhere in this
+    // file, see dpram_copy): newlib's memset aligns to dst then uses word
+    // stores, and dst (0x50100000) and size (4096) are both word-aligned.
     memset((void *)usbh_dpram, 0, sizeof(*usbh_dpram));
 
     // Connect controller to the on-chip PHY, force VBUS-detect high (our VBUS
@@ -219,7 +237,7 @@ static hcd_result_t epx_single_packet(uint8_t dev_addr, uint8_t ep_num,
     uint16_t bc = (uint16_t)(len | USB_BUF_CTRL_LAST | USB_BUF_CTRL_AVAIL
                   | (toggle ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID));
     if (!dir_in) {
-        if (len) memcpy(epx_buf, buf, len);
+        if (len) dpram_copy(epx_buf, buf, len);
         bc |= USB_BUF_CTRL_FULL;
     }
     usb_hw_clear->buf_status = 1u;               // stale EPX buffer flag
@@ -237,7 +255,7 @@ static hcd_result_t epx_single_packet(uint8_t dev_addr, uint8_t ep_num,
     if (dir_in) {
         uint16_t rx = epx_buf_ctrl_read_half(0) & USB_BUF_CTRL_LEN_MASK;
         if (rx > len) rx = len;
-        memcpy(buf, epx_buf, rx);
+        dpram_copy(buf, epx_buf, rx);
         *actual = rx;
     } else {
         *actual = len;
@@ -252,7 +270,7 @@ hcd_result_t hcd_control_xfer(uint8_t dev_addr, const uint8_t setup[8],
     uint16_t wlen = (uint16_t)(setup[6] | (setup[7] << 8));
 
     // --- SETUP stage: 8 bytes from the dedicated DPRAM setup area, DATA0 ---
-    memcpy((void *)usbh_dpram->setup_packet, setup, 8);
+    dpram_copy((void *)usbh_dpram->setup_packet, setup, 8);
     usb_hw->dev_addr_ctrl = dev_addr;            // endpoint 0
     sie_start_transfer(USB_SIE_CTRL_SEND_SETUP_BITS);
     hcd_result_t r = sie_wait_trans_complete(100);
@@ -311,7 +329,7 @@ static void epx_prime_half(int half, bool dir_in, const uint8_t *src,
                   | (*toggle ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID));
     if (n == remaining) bc |= USB_BUF_CTRL_LAST;
     if (!dir_in) {
-        memcpy(epx_buf + half * 64, src + *queued, n);
+        dpram_copy(epx_buf + half * 64, src + *queued, n);
         bc |= USB_BUF_CTRL_FULL;
     }
     *queued += n;
@@ -378,7 +396,7 @@ hcd_result_t hcd_bulk_xfer(uint8_t dev_addr, uint8_t ep_addr, uint8_t *toggle,
                 uint32_t cap = len - done;                   // user-buffer headroom
                 if (cap > 64) cap = 64;                      // half size
                 if (rx > cap) rx = (uint16_t)cap;            // babble guard
-                memcpy(p + done, epx_buf + next_half * 64, rx);
+                dpram_copy(p + done, epx_buf + next_half * 64, rx);
                 done += rx;
                 pkts_consumed++;
                 if (rx < 64) {                               // short packet ends transfer
@@ -481,7 +499,7 @@ int hcd_int_ep_poll(uint8_t *buf, uint8_t maxlen) {
     uint16_t bc = ((io_rw_16 *)&usbh_dpram->int_ep_buffer_ctrl[0].ctrl)[0];
     uint16_t n = bc & USB_BUF_CTRL_LEN_MASK;
     if (n > maxlen) n = maxlen;
-    memcpy(buf, int_ep_buf, n);
+    dpram_copy(buf, int_ep_buf, n);
     // The hardware retries NAKed polls invisibly and only completes (raising
     // BUFF_STATUS) when a report actually lands, so the toggle advances
     // exactly once per delivered report.
