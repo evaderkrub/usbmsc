@@ -2,36 +2,33 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "usb_hcd.h"
-
-static void hexdump(const uint8_t *p, int n) {
-    for (int i = 0; i < n; i++) printf("%02x ", p[i]);
-    printf("\n");
-}
+#include "usb_core.h"
 
 int main(void) {
     stdio_init_all();
     sleep_ms(1000);
-    printf("usbmsc bench: stage 2 — device descriptor\n");
+    printf("usbmsc bench: stage 3 — enumeration\n");
     hcd_init();
 
     for (;;) {
         while (hcd_port_speed() != HCD_SPEED_FULL) sleep_ms(10);
         printf("port: full-speed device, resetting\n");
-        sleep_ms(100);                       // attach debounce
+        sleep_ms(100);
         hcd_bus_reset();
-
-        // GET_DESCRIPTOR(device), first 8 bytes, address 0
-        const uint8_t setup[8] = {0x80, 6, 0, 1, 0, 0, 8, 0};
-        uint8_t desc[8];
-        uint16_t len = sizeof desc;
-        hcd_result_t r = hcd_control_xfer(0, setup, desc, &len);
-        if (r == HCD_OK) {
-            printf("device descriptor head (%u bytes): ", len);
-            hexdump(desc, len);
-            printf("bLength=%u bDescriptorType=%u bcdUSB=%x.%02x bMaxPacketSize0=%u\n",
-                   desc[0], desc[1], desc[3], desc[2], desc[7]);
+        usb_device_t dev;
+        hcd_result_t r = core_enumerate(1, &dev);
+        if (r != HCD_OK) {
+            printf("enumeration failed: %d\n", (int)r);
         } else {
-            printf("control transfer failed: %d\n", (int)r);
+            printf("enumerated addr=%u vid=%04x pid=%04x ep0_mps=%u\n",
+                   dev.addr, dev.vid, dev.pid, dev.ep0_mps);
+            if (dev.cfg.is_msc)
+                printf("MSC: itf=%u bulk_in=%02x bulk_out=%02x mps=%u/%u\n",
+                       dev.cfg.msc_itf, dev.cfg.bulk_in, dev.cfg.bulk_out,
+                       dev.cfg.bulk_in_mps, dev.cfg.bulk_out_mps);
+            if (dev.cfg.is_hub)
+                printf("HUB: int_ep=%02x mps=%u interval=%u\n",
+                       dev.cfg.hub_int_ep, dev.cfg.hub_int_mps, dev.cfg.hub_int_interval);
         }
         while (hcd_port_speed() != HCD_SPEED_NONE) sleep_ms(10);
         printf("port: disconnected\n");
